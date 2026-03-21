@@ -28,10 +28,10 @@ Convert a YouTube playlist into an Obsidian-ready vault — transcripts + AI-gen
 **Option A — Environment variables (recommended):**
 
 ```powershell
-$env:PLAYLIST_VAULT_YT2TXT   = "C:\path\to\helpers\yt2txt.ps1"
-$env:PLAYLIST_VAULT_WHISPER  = "C:\path\to\Whisper"
-$env:PLAYLIST_VAULT_AUDIO    = "C:\path\to\YouTube"
-$env:PLAYLIST_VAULT_OBSIDIAN = "C:\path\to\Obsidian\Series Vault"
+$env:YTTXT_DOWNLOAD_DIR   = "D:\Media\YouTube"
+$env:YTTXT_WHISPER_DIR    = "E:\AI\Whisper"
+$env:YTTXT_TRANSCRIBER    = "C:\tools\Transcribe-GPU.ps1"
+$env:YTTXT_RUMBLE_DIR     = "D:\Media\Rumble"  # optional
 ```
 
 **Option B — Local config file (gitignored):**
