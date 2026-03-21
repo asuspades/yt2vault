@@ -1,28 +1,34 @@
 <#
 .SYNOPSIS
-    playlist-to-vault.ps1 - Convert a YouTube playlist into an Obsidian-ready vault
+    playlist2vault.ps1 - Playlist OR Channel Streams → transcripts + outlines
 
 .DESCRIPTION
-    - Prompts for a YouTube playlist URL or playlist ID
-    - Resolves channel + playlist name automatically
+    - Accepts:
+        • Playlist URL / ID
+        • Channel /streams URL
     - Downloads captions (preferred, no GPU)
     - Falls back to Whisper only if needed
-    - Saves transcripts locally (Documents\YouTube Transcripts\<Channel>)
-    - Saves outlines to Obsidian Series Vault
+    - Saves transcripts locally
+    - Saves outlines to Obsidian Channel Vault
     - Skips existing files unless -Force
 
 .REQUIRES
-    yt-dlp, Firefox cookies, Ollama (optional), Whisper (optional)
+    yt-dlp, Firefox cookies, Node.js, Ollama (optional), Whisper (optional)
 
-.SETUP
-    Configure via environment variables (recommended) or edit the CONFIG section.
-    See README.md for full setup instructions.
+.CONFIGURATION
+    Set paths via ONE of these methods (in order of precedence):
+    1. Environment variables: PV_YT2TXT, PV_WHISPER_DIR, PV_AUDIO_DIR,
+       PV_NODE_EXE, PV_TRANSCRIPTS, PV_OBSIDIAN
+    2. Local config file: config.local.ps1 (gitignored)
+    3. Defaults: Relative to $PSScriptRoot or user Documents folder
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Playlist,
-    [string]$Model = "gemma3:12b",
+    [Parameter(Mandatory=$true)]
+    [string]$Source,
+
+    [string]$Model = "gemma3:27b",
     [int]$Limit = 0,
     [switch]$Oldest,
     [switch]$Force,
@@ -30,7 +36,8 @@ param(
     [switch]$UseWhisper,
     [switch]$NoWhisperFallback,
     [switch]$DryRun,
-    [ValidateSet('firefox', 'chrome', 'edge', 'safari')]
+
+    [ValidateSet('firefox','chrome','edge','safari','brave')]
     [string]$CookieBrowser = 'firefox'
 )
 
@@ -38,83 +45,128 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ─────────────────────────────────────────
-# CONFIG
+# LOAD OPTIONAL LOCAL CONFIG (gitignored)
 # ─────────────────────────────────────────
-# Set environment variables to avoid editing this file:
-#   PLAYLIST_VAULT_YT2TXT   - Path to yt2txt.ps1 helper script
-#   PLAYLIST_VAULT_WHISPER  - Directory for Whisper output
-#   PLAYLIST_VAULT_AUDIO    - Directory for temporary audio downloads
-#   PLAYLIST_VAULT_OBSIDIAN - Root of your Obsidian Series Vault
-#
-# Or create a gitignored config.local.ps1 next to this script with overrides.
-
 $localConfig = Join-Path $PSScriptRoot "config.local.ps1"
 if (Test-Path $localConfig) {
     Write-Verbose "Loading local config: $localConfig"
     . $localConfig
 }
 
-$Yt2TxtScript = $env:PLAYLIST_VAULT_YT2TXT    ?? (Join-Path $PSScriptRoot "helpers\yt2txt.ps1")
-$WhisperDir   = $env:PLAYLIST_VAULT_WHISPER   ?? (Join-Path $PSScriptRoot "data\whisper")
-$AudioDir     = $env:PLAYLIST_VAULT_AUDIO     ?? (Join-Path $PSScriptRoot "data\audio")
-$ObsidianRoot = $env:PLAYLIST_VAULT_OBSIDIAN  ?? ""
+# ─────────────────────────────────────────
+# CONFIG - Resolved from env vars → local override → defaults
+# ─────────────────────────────────────────
 
+$Yt2TxtScript = $env:PV_YT2TXT ?? $script:ConfigOverride?.Yt2TxtScript ?? ""
+$WhisperDir   = $env:PV_WHISPER_DIR ?? $script:ConfigOverride?.WhisperDir ?? ""
+$AudioDir     = $env:PV_AUDIO_DIR ?? $script:ConfigOverride?.AudioDir ?? ""
+$NodeExe      = $env:PV_NODE_EXE ?? $script:ConfigOverride?.NodeExe ?? "node"
+$TranscriptRoot = $env:PV_TRANSCRIPTS ?? $script:ConfigOverride?.TranscriptRoot ?? ""
+$ObsidianRoot   = $env:PV_OBSIDIAN ?? $script:ConfigOverride?.ObsidianRoot ?? ""
+
+# Fallback defaults (safe for Git, relative to script or user folders)
+if (-not $Yt2TxtScript) { $Yt2TxtScript = Join-Path $PSScriptRoot "helpers\yt2txt.ps1" }
+if (-not $WhisperDir)   { $WhisperDir   = Join-Path $PSScriptRoot "data\whisper" }
+if (-not $AudioDir)     { $AudioDir     = Join-Path $PSScriptRoot "data\audio" }
+if (-not $TranscriptRoot) {
+    $TranscriptRoot = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "YouTube Transcripts"
+    Write-Verbose "TranscriptRoot not set. Using default: $TranscriptRoot"
+}
 if (-not $ObsidianRoot) {
-    $ObsidianRoot = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Obsidian\Series Vault"
-    Write-Warning "PLAYLIST_VAULT_OBSIDIAN not set. Using default: $ObsidianRoot"
+    $ObsidianRoot = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Obsidian\Youtube Channel Vault"
+    Write-Warning "ObsidianRoot not set. Using default: $ObsidianRoot"
+}
+
+# Validate critical optional dependency
+if ($Yt2TxtScript -and -not (Test-Path $Yt2TxtScript)) {
+    Write-Warning "Yt2TxtScript not found: $Yt2TxtScript (Whisper fallback will be disabled)"
 }
 
 # ─────────────────────────────────────────
-# INPUT
+# DETECT INPUT TYPE
 # ─────────────────────────────────────────
 
-if (-not $Playlist) {
-    $Playlist = Read-Host "Enter YouTube playlist URL or playlist ID"
-}
+$isPlaylist = $false
+$isChannel  = $false
 
-if ($Playlist -match 'list=([A-Za-z0-9_-]+)') {
-    $PlaylistId = $Matches[1]
+if ($Source -match 'list=([A-Za-z0-9_-]+)' -or $Source -match '^PL[A-Za-z0-9_-]{16,}$') {
+    $isPlaylist = $true
 }
-elseif ($Playlist -match '^PL[A-Za-z0-9_-]{16,}$') {
-    $PlaylistId = $Playlist
+elseif ($Source -match 'youtube\.com/@[^/]+/streams') {
+    $isChannel = $true
 }
 else {
-    Write-Error "Invalid playlist input"
+    Write-Error "Input must be playlist URL/ID OR channel /streams URL"
     exit 1
 }
 
-$PlaylistUrl = "https://www.youtube.com/playlist?list=$PlaylistId"
-
 # ─────────────────────────────────────────
-# RESOLVE CHANNEL + PLAYLIST
+# LOAD METADATA
 # ─────────────────────────────────────────
 
 Write-Host "Resolving metadata..." -ForegroundColor Cyan
 
-$json = & yt-dlp `
-    --cookies-from-browser $CookieBrowser `
-    --flat-playlist -J `
-    --no-warnings `
-    $PlaylistUrl 2>$null | ConvertFrom-Json
+if ($isPlaylist) {
 
-if (-not $json) { throw "Failed to load playlist" }
+    if ($Source -match 'list=([A-Za-z0-9_-]+)') {
+        $PlaylistId = $Matches[1]
+    } else {
+        $PlaylistId = $Source
+    }
 
-$channelName   = ($json.uploader -replace '[<>:"/\\|?*]', '').Trim()
-$playlistTitle = ($json.title    -replace '[<>:"/\\|?*]', '').Trim()
+    $SourceUrl = "https://www.youtube.com/playlist?list=$PlaylistId"
 
-$TranscriptRoot = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "YouTube Transcripts"
+    $json = & yt-dlp `
+        --cookies-from-browser $CookieBrowser `
+        --js-runtimes $NodeExe `
+        --flat-playlist -J `
+        --no-warnings `
+        $SourceUrl 2>$null | ConvertFrom-Json
+
+    $channelName = ($json.uploader -replace '[<>:"/\\|?*]', '').Trim()
+    $collection  = ($json.title    -replace '[<>:"/\\|?*]', '').Trim()
+}
+
+if ($isChannel) {
+
+    $SourceUrl = $Source
+
+    $json = & yt-dlp `
+        --cookies-from-browser $CookieBrowser `
+        --js-runtimes $NodeExe `
+        --flat-playlist -J `
+        --no-warnings `
+        $SourceUrl 2>$null | ConvertFrom-Json
+
+    # Try multiple fields in order of reliability
+    $channelName = $null
+    foreach ($field in @($json.channel, $json.uploader, $json.entries[0].channel, $json.entries[0].uploader)) {
+        if ($field -and $field.Trim()) {
+            $channelName = ($field -replace '[<>:"/\\|?*]', '').Trim()
+            break
+        }
+    }
+
+    if (-not $channelName) {
+        # Last resort: extract from URL (@handle)
+        if ($Source -match '@([^/]+)') {
+            $channelName = $Matches[1]
+        } else {
+            $channelName = "UnknownChannel"
+        }
+    }
+
+    $collection = "Livestream"
+}
+
 $TranscriptsDir = Join-Path $TranscriptRoot $channelName
-$OutlinesDir    = Join-Path $ObsidianRoot "$channelName\$playlistTitle"
-$TempDir        = Join-Path $env:TEMP "playlist2vault_$PlaylistId"
+$OutlinesDir    = Join-Path $ObsidianRoot "$channelName\$collection"
+$TempDir        = Join-Path $env:TEMP ("vault_" + ([guid]::NewGuid().ToString().Substring(0,8)))
 
-Write-Host "Channel:     $channelName"   -ForegroundColor Cyan
-Write-Host "Playlist:    $playlistTitle" -ForegroundColor Cyan
+Write-Host "Channel:     $channelName" -ForegroundColor Cyan
+Write-Host "Collection:  $collection"  -ForegroundColor Cyan
 Write-Host "Transcripts: $TranscriptsDir" -ForegroundColor DarkGray
-Write-Host "Outlines:    $OutlinesDir"   -ForegroundColor DarkGray
-
-# ─────────────────────────────────────────
-# SETUP
-# ─────────────────────────────────────────
+Write-Host "Outlines:    $OutlinesDir"    -ForegroundColor DarkGray
 
 @($TranscriptsDir, $OutlinesDir, $TempDir) | ForEach-Object {
     if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
@@ -130,204 +182,187 @@ function Sanitize {
 }
 
 function Convert-VttToTxt {
-    param(
-        [string]$VttPath,
-        [string]$TxtPath
-    )
+    param($VttPath, $TxtPath)
 
-    $lines = Get-Content -LiteralPath $VttPath -Encoding UTF8
-
-    $content = @()
+    $lines = Get-Content $VttPath
+    $buf   = [System.Collections.Generic.List[string]]::new()
+    $seen  = [System.Collections.Generic.HashSet[string]]::new()
 
     foreach ($l in $lines) {
-        if ([string]::IsNullOrWhiteSpace($l)) { continue }
+        # Skip header, blank, timestamp-only lines
+        if ($l -match '^\s*$') { continue }
+        if ($l -match '^\d{2}:\d{2}:\d{2}\.\d{3} -->') { continue }
         if ($l -match '^WEBVTT') { continue }
         if ($l -match '^Kind:') { continue }
         if ($l -match '^Language:') { continue }
-        if ($l -match '^NOTE') { continue }
-        if ($l -match '^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->') { continue }
 
-        if ($l -match '<\d{2}:\d{2}:\d{2}\.\d{3}>') {
-            $clean = ($l -replace '<[^>]+>', '').Trim()
-            if ($clean) {
-                $clean = $clean -replace '^\s*>>\s*', ''
-                $content += $clean
-            }
+        # Strip inline timing tags  <00:00:00.000>
+        $clean = ($l -replace '<[^>]+>', '').Trim()
+        if ($clean -and $seen.Add($clean)) {
+            $buf.Add($clean)
         }
     }
 
-    $text = ($content -join ' ') -replace '\s{2,}', ' '
-    $text = $text.Trim()
-
-    $sentences = [regex]::Split($text, '(?<=[.!?])\s+(?=[A-Z])')
-
-    $paras = @()
-    $buf   = @()
-
-    foreach ($s in $sentences) {
-        $buf += $s
-        if ($buf.Count -ge 5) {
-            $paras += ($buf -join ' ').Trim()
-            $buf = @()
-        }
-    }
-
-    if ($buf.Count -gt 0) {
-        $paras += ($buf -join ' ').Trim()
-    }
-
-    ($paras -join "`n`n") | Out-File -LiteralPath $TxtPath -Encoding utf8 -NoNewline
+    ($buf -join ' ') -replace '\s{2,}', ' ' | Out-File -LiteralPath $TxtPath -Encoding utf8
 }
 
 function Get-Captions {
-    param(
-        [string]$Id,
-        [string]$OutPath
+    param($id, $out)
+
+    Remove-Item "$TempDir\$id*" -Force -ErrorAction SilentlyContinue
+
+    $commonArgs = @(
+        '--cookies-from-browser', $CookieBrowser,
+        '--js-runtimes',          $NodeExe,
+        '--write-auto-sub',
+        '--sub-lang',             'en',
+        '--sub-format',           'vtt',
+        '--skip-download',
+        '--ignore-no-formats-error',
+        '--no-warnings',
+        '--socket-timeout',       '30',
+        '-o',                     "$TempDir\$id",
+        "https://www.youtube.com/watch?v=$id"
     )
 
-    Remove-Item "$TempDir\$Id*" -Force -ErrorAction SilentlyContinue
+    # PASS 1 — default client
+    & yt-dlp @commonArgs 2>&1 | Out-Null
 
-    # ── PASS 1: cookies + web client (primary)
-    & yt-dlp `
-        --cookies-from-browser $CookieBrowser `
-        --write-auto-sub `
-        --sub-lang en `
-        --sub-format vtt `
-        --skip-download `
-        --no-warnings `
-        --ignore-no-formats-error `
-        -o "$TempDir\$Id" `
-        "https://www.youtube.com/watch?v=$Id" 2>$null
+    $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue | Select-Object -First 1
 
-    $vtt = Get-ChildItem -LiteralPath $TempDir -Filter "$Id*.vtt" -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-
-    # ── PASS 2: android client (fallback, no cookies)
+    # PASS 2 — android client fallback
     if (-not $vtt) {
-        & yt-dlp `
-            --write-auto-sub `
-            --sub-lang en `
-            --sub-format vtt `
-            --skip-download `
-            --no-warnings `
-            --ignore-no-formats-error `
-            --extractor-args "youtube:player_client=android" `
-            -o "$TempDir\$Id" `
-            "https://www.youtube.com/watch?v=$Id" 2>$null
-
-        $vtt = Get-ChildItem -LiteralPath $TempDir -Filter "$Id*.vtt" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+        & yt-dlp @commonArgs '--extractor-args' 'youtube:player_client=android' 2>&1 | Out-Null
+        $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue | Select-Object -First 1
     }
 
     if (-not $vtt) { return $false }
 
-    Convert-VttToTxt -VttPath $vtt.FullName -TxtPath $OutPath
-    Remove-Item -LiteralPath $vtt.FullName -Force -ErrorAction SilentlyContinue
-
+    Convert-VttToTxt $vtt.FullName $out
+    Remove-Item $vtt.FullName -Force -ErrorAction SilentlyContinue
     return $true
 }
 
 function Get-Whisper {
-    param(
-        [string]$Id,
-        [string]$OutPath
-    )
+    param($id, $out)
 
-    if (-not (Test-Path -LiteralPath $Yt2TxtScript)) {
-        Write-Host "    -> Whisper script not found at: $Yt2TxtScript" -ForegroundColor Yellow
-        return $false
-    }
+    if (-not (Test-Path $Yt2TxtScript)) { return $false }
 
-    Write-Host "    -> Running Whisper..." -ForegroundColor Yellow
+    & $Yt2TxtScript -Url "https://www.youtube.com/watch?v=$id" `
+        -DownloadDir $AudioDir `
+        -WhisperDir  $WhisperDir
 
-    try {
-        & $Yt2TxtScript `
-            -Url "https://www.youtube.com/watch?v=$Id" `
-            -DownloadDir $AudioDir `
-            -WhisperDir $WhisperDir `
-            -Engine faster `
-            -Preset max `
-            -Model medium.en
+    Start-Sleep 2
 
-        Start-Sleep 2
+    $txt = Get-ChildItem $WhisperDir -Filter "*$id*.txt" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
 
-        $txt = Get-ChildItem -LiteralPath $WhisperDir -Filter "*$Id*.txt" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-        if ($txt) {
-            Copy-Item -LiteralPath $txt.FullName -Destination $OutPath -Force
-
-            Get-ChildItem -LiteralPath $AudioDir -Filter "*$Id*" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -match '\.(mp3|webm|m4a|opus|wav)$' } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-
-            return $true
-        }
-    }
-    catch {
-        Write-Host "    -> Whisper failed: $_" -ForegroundColor Red
+    if ($txt) {
+        Copy-Item $txt.FullName $out -Force
+        return $true
     }
 
     return $false
 }
 
-$OutlinePrompt = @"
-Summarize this transcript into a structured markdown outline.
+$OutlinePrompt = @'
+You are a transcript analyst. Your ONLY job is to output a Content Brief in the EXACT format shown below. Do NOT write prose analysis. Do NOT write essays. Do NOT add commentary. Do NOT deviate from the template. Begin your response with the # Content Brief heading and nothing else.
 
-Include:
-- TL;DR
-- Key sections
-- Important arguments
-- Notable quotes
+REQUIRED OUTPUT FORMAT — FOLLOW EXACTLY:
 
-Be concise and structured.
-"@
+# Content Brief: [Speaker Name/Content Title]
+
+**TL;DR:** [2-3 sentence summary of key takeaways]
+
+## Main Discussion Points
+
+- **[Primary Topic/Theme]**
+
+  - Key insight or development
+  - Supporting detail with context
+  - Relevant statistics or examples
+  - "[Powerful direct quote from the transcript]"
+  - Additional supporting information
+
+- **[Secondary Topic/Theme]**
+
+  - Key insight or development
+  - Background context and implications
+  - "[Another direct quote from the transcript]"
+  - Related details and consequences
+
+## Resources Discussed
+
+- [ ] **Resource Title** by Author/Organization (Year if mentioned) - One sentence on relevance
+- [ ] **Another Resource Title** by Author/Organization (Year if mentioned) - One sentence on relevance
+
+---
+
+INSTRUCTIONS:
+
+1. TL;DR: 2-3 sentences capturing the main takeaways.
+
+2. Main Discussion Points: Comprehensive hierarchical breakdown. Cover ALL major topics. Each topic gets multiple sub-bullets with depth, context, and at least one direct quote from the transcript. Include 5-8 total quotes across all sections. Quotes must be actual words spoken in the transcript, not paraphrases.
+
+3. Resources Discussed: List every named work that was meaningfully discussed, recommended, or used as evidence—books, films, TV shows, albums, documentaries, websites, YouTube channels, podcasts, academic papers. Each entry should be something a reader would actually want to seek out based on the conversation. Exclude passing name-drops with no context. Use - [ ] checkbox format so the reader can track what they have viewed or acquired.
+
+Begin your response now with # Content Brief:
+'@
 
 function Get-Outline {
-    param(
-        [string]$TranscriptPath,
-        [string]$OutPath,
-        [string]$Title,
-        [string]$Id
-    )
+    param($txt, $md)
 
     if ($NoOutline) { return $false }
 
-    if (-not (Test-Path -LiteralPath $TranscriptPath)) { return $false }
+    $raw = Get-Content -LiteralPath $txt -Raw
+    if (-not $raw) { return $false }
 
-    $text = Get-Content -LiteralPath $TranscriptPath -Raw
-    if (-not $text.Trim()) { return $false }
+    $userMsg = $OutlinePrompt + "`n`n--- TRANSCRIPT START ---`n$raw`n--- TRANSCRIPT END ---"
 
-    $prompt = "$OutlinePrompt`n`nVIDEO TITLE: $Title`nVIDEO ID: $Id`n`nTRANSCRIPT:`n$text"
+    # Serialize via .NET JsonSerializer to handle em-dashes, smart quotes,
+    # and other non-ASCII cleanly across all PowerShell versions.
+    $bodyObj = [ordered]@{
+        model    = $Model
+        stream   = $false
+        options  = [ordered]@{ num_ctx = 131072 }
+        messages = @(
+            [ordered]@{ role = "user";      content = $userMsg }
+            [ordered]@{ role = "assistant"; content = "# Content Brief:" }
+        )
+    }
+
+    # PS 5.1 ConvertTo-Json has a known bug with long strings containing
+    # certain unicode chars. Use .NET's JavaScriptSerializer instead.
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
+    $jss = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+    $jss.MaxJsonLength = [int]::MaxValue
+
+    $bodyJson  = $jss.Serialize($bodyObj)
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
 
     try {
-        $body = @{
-            model  = $Model
-            prompt = $prompt
-            stream = $false
-        } | ConvertTo-Json -Depth 5
+        $r = Invoke-RestMethod `
+            -Uri         "http://127.0.0.1:11434/api/chat" `
+            -Method      POST `
+            -Body        $bodyBytes `
+            -ContentType "application/json; charset=utf-8" `
+            -TimeoutSec  1200
 
-        $resp = Invoke-RestMethod `
-            -Uri "http://127.0.0.1:11434/api/generate" `
-            -Method POST `
-            -Body $body `
-            -ContentType "application/json"
-
-        if ($resp.response) {
-            $resp.response | Out-File -LiteralPath $OutPath -Encoding utf8
+        $text = $r.message.content
+        if ($text) {
+            ("# Content Brief:" + $text) | Out-File -LiteralPath $md -Encoding utf8
             return $true
         }
-    }
-    catch {
-        Write-Host "    -> Ollama failed: $_" -ForegroundColor Yellow
+    } catch {
+        Write-Host "  -> Ollama error: $_" -ForegroundColor Red
     }
 
     return $false
 }
 
 # ─────────────────────────────────────────
-# MAIN
+# BUILD VIDEO LIST
 # ─────────────────────────────────────────
 
 $videos = $json.entries | ForEach-Object {
@@ -337,8 +372,14 @@ $videos = $json.entries | ForEach-Object {
     }
 }
 
-if ($Oldest)    { [array]::Reverse($videos) }
+if ($Oldest) { [array]::Reverse($videos) }
 if ($Limit -gt 0) { $videos = $videos | Select-Object -First $Limit }
+
+Write-Host "Videos found: $($videos.Count)" -ForegroundColor Cyan
+
+# ─────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────
 
 $processed = 0
 
@@ -347,28 +388,31 @@ foreach ($v in $videos) {
     Write-Host "`n$($v.Title)" -ForegroundColor Yellow
 
     $safe = Sanitize $v.Title
-    $txt  = Join-Path $TranscriptsDir "$safe [$($v.Id)].txt"
-    $md   = Join-Path $OutlinesDir    "$safe [$($v.Id)].md"
+
+    $txt = Join-Path $TranscriptsDir "$safe [$($v.Id)].txt"
+    $md  = Join-Path $OutlinesDir    "$safe [$($v.Id)].md"
 
     if (-not $Force -and (Test-Path -LiteralPath $txt) -and (Test-Path -LiteralPath $md)) {
         Write-Host "  -> Skipping (exists)" -ForegroundColor DarkGray
         continue
     }
 
-    # ── TRANSCRIPT ─────────────────────────
+    if ($DryRun) {
+        Write-Host "  -> DryRun" -ForegroundColor DarkGray
+        continue
+    }
 
-    if (-not (Test-Path -LiteralPath $txt) -or $Force) {
+    if (-not (Test-Path -LiteralPath $txt)) {
 
         $ok = $false
 
-        if (-not $UseWhisper) {
-            Write-Host "  -> Captions..." -ForegroundColor Cyan
-            $ok = Get-Captions $v.Id $txt
+        Write-Host "  -> Captions..." -ForegroundColor Cyan
+        $ok = Get-Captions $v.Id $txt
 
-            if (-not $ok) {
-                Start-Sleep 1
-                $ok = Get-Captions $v.Id $txt
-            }
+        if (-not $ok) {
+            Start-Sleep 2
+            Write-Host "  -> Captions retry..." -ForegroundColor Cyan
+            $ok = Get-Captions $v.Id $txt
         }
 
         if (-not $ok -and -not $NoWhisperFallback) {
@@ -377,36 +421,25 @@ foreach ($v in $videos) {
         }
 
         if (-not $ok) {
-            Write-Host "  -> Failed" -ForegroundColor Red
+            Write-Host "  -> Failed (no transcript)" -ForegroundColor Red
             continue
         }
-
-        Write-Host "  -> Transcript saved" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  -> Using existing transcript" -ForegroundColor DarkGray
     }
 
-    # ── OUTLINE ────────────────────────────
+    if (-not (Test-Path -LiteralPath $md)) {
+        Write-Host "  -> Outline..." -ForegroundColor Cyan
 
-    if (-not (Test-Path -LiteralPath $md) -or $Force) {
-
-        if (Test-Path -LiteralPath $txt) {
-            Write-Host "  -> Outline..." -ForegroundColor Cyan
-
-            if (Get-Outline $txt $md $v.Title $v.Id) {
-                Write-Host "  -> Outline saved" -ForegroundColor Green
-            }
-            else {
-                Write-Host "  -> Outline skipped/failed" -ForegroundColor DarkGray
-            }
+        if (Get-Outline $txt $md) {
+            Write-Host "  -> Saved" -ForegroundColor Green
+        } else {
+            Write-Host "  -> Outline skipped/failed" -ForegroundColor DarkGray
         }
-    }
-    else {
-        Write-Host "  -> Using existing outline" -ForegroundColor DarkGray
     }
 
     $processed++
 }
 
-Write-Host "`nDone. Processed: $processed" -ForegroundColor Cyan
+# Cleanup temp
+Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "`nDone: $processed / $($videos.Count)" -ForegroundColor Cyan
