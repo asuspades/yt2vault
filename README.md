@@ -247,7 +247,3 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 
 MIT © 2026. Free for personal and commercial use.  
 *This tool is not affiliated with YouTube, Google, Obsidian, or Ollama.*
-
----
-
-> 🎯 **Pro Tip**: Combine with [Obsidian's "Watch" plugin](https://github.com/obsidian-community/obsidian-community-plugins) to auto-reload new notes as they're generated!
