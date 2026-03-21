@@ -1,18 +1,16 @@
-# Local config override (users create their own)
+# Local config (users create their own)
 config.local.ps1
 *.local.*
 .env
 
 # Runtime data
 data/
-temp/
-*.log
-*.vtt
+*.mp3
 *.txt
-*.md
+*.vtt
+*.log
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
-*.ps1xml
