@@ -1,0 +1,11 @@
+# config.local.ps1 - Copy to config.local.ps1 and edit (gitignored)
+# Paths are resolved: env vars → this file → script defaults
+
+$script:ConfigOverride = @{
+    Yt2TxtScript      = "C:\Users\You\tools\yt2txt.ps1"  # Whisper helper script
+    WhisperDir        = "C:\Users\You\whisper-output"    # Whisper .txt outputs
+    AudioDir          = "C:\Users\You\youtube-audio-cache" # Temp audio downloads
+    NodeExe           = "node"                           # Or full path: "node:C:\Program Files\nodejs\node.exe"
+    TranscriptRoot    = "D:\Archives\YouTube\Transcripts" # Where .txt transcripts go
+    ObsidianRoot      = "C:\Users\You\Obsidian\Vaults\Youtube Channel Vault" # Your vault path
+}
