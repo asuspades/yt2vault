@@ -1,19 +1,22 @@
 <#
 .SYNOPSIS
-    playlist2vault.ps1 - Playlist OR Channel Streams → transcripts + outlines
+    playlist2vault.ps1 - Playlist OR Channel → transcripts + outlines
 
 .DESCRIPTION
     - Accepts:
         • Playlist URL / ID
-        • Channel /streams URL
+        • Channel /streams, /videos, or /shorts URL
     - Downloads captions (preferred, no GPU)
     - Falls back to Whisper only if needed
+    - Filenames: {position} {title} [{id}]  (position = oldest-first index)
+    - Sets filesystem timestamps from YouTube upload date
+    - Skip logic matches by video ID — survives renames
     - Saves transcripts locally
     - Saves outlines to Obsidian Channel Vault
     - Skips existing files unless -Force
 
 .REQUIRES
-    yt-dlp, Firefox cookies, Node.js, Ollama (optional), Whisper (optional)
+    yt-dlp, browser cookies, Node.js, Ollama (optional), Whisper (optional)
 
 .CONFIGURATION
     Set paths via ONE of these methods (in order of precedence):
@@ -92,11 +95,11 @@ $isChannel  = $false
 if ($Source -match 'list=([A-Za-z0-9_-]+)' -or $Source -match '^PL[A-Za-z0-9_-]{16,}$') {
     $isPlaylist = $true
 }
-elseif ($Source -match 'youtube\.com/@[^/]+/streams') {
+elseif ($Source -match 'youtube\.com/@[^/]+/(streams|videos|shorts)') {
     $isChannel = $true
 }
 else {
-    Write-Error "Input must be playlist URL/ID OR channel /streams URL"
+    Write-Error "Input must be a playlist URL/ID or a channel /streams, /videos, or /shorts URL"
     exit 1
 }
 
@@ -148,15 +151,13 @@ if ($isChannel) {
     }
 
     if (-not $channelName) {
-        # Last resort: extract from URL (@handle)
-        if ($Source -match '@([^/]+)') {
-            $channelName = $Matches[1]
-        } else {
-            $channelName = "UnknownChannel"
-        }
+        if ($Source -match '@([^/]+)') { $channelName = $Matches[1] }
+        else                           { $channelName = "UnknownChannel" }
     }
 
-    $collection = "Livestream"
+    $collection = if ($Source -match '/streams') { "Livestream" } `
+                  elseif ($Source -match '/shorts') { "Shorts" } `
+                  else { "Videos" }
 }
 
 $TranscriptsDir = Join-Path $TranscriptRoot $channelName
@@ -181,6 +182,20 @@ function Sanitize {
     $t -replace '[<>:"/\\|?*]', '' -replace '\s+', ' ' | ForEach-Object { $_.Trim() }
 }
 
+# Strip leading "Channel Name - " or "Channel Name: " prefix from title
+function Strip-ChannelPrefix {
+    param([string]$title, [string]$channel)
+    $escaped = [regex]::Escape($channel)
+    $title -replace "^$escaped\s*[-:]\s*", ''
+}
+
+# Zero-padded position string based on total count
+function Format-Position {
+    param([int]$pos, [int]$total)
+    $width = $total.ToString().Length
+    $pos.ToString().PadLeft($width, '0')
+}
+
 function Convert-VttToTxt {
     param($VttPath, $TxtPath)
 
@@ -189,14 +204,12 @@ function Convert-VttToTxt {
     $seen  = [System.Collections.Generic.HashSet[string]]::new()
 
     foreach ($l in $lines) {
-        # Skip header, blank, timestamp-only lines
         if ($l -match '^\s*$') { continue }
         if ($l -match '^\d{2}:\d{2}:\d{2}\.\d{3} -->') { continue }
         if ($l -match '^WEBVTT') { continue }
         if ($l -match '^Kind:') { continue }
         if ($l -match '^Language:') { continue }
 
-        # Strip inline timing tags  <00:00:00.000>
         $clean = ($l -replace '<[^>]+>', '').Trim()
         if ($clean -and $seen.Add($clean)) {
             $buf.Add($clean)
@@ -204,6 +217,40 @@ function Convert-VttToTxt {
     }
 
     ($buf -join ' ') -replace '\s{2,}', ' ' | Out-File -LiteralPath $TxtPath -Encoding utf8
+}
+
+# Fetch upload timestamp from YouTube for a given video ID
+function Get-UploadDate {
+    param([string]$id)
+
+    $ts = & yt-dlp `
+        --cookies-from-browser $CookieBrowser `
+        --js-runtimes $NodeExe `
+        --no-warnings `
+        --print "%(timestamp)s" `
+        "https://www.youtube.com/watch?v=$id" 2>$null
+
+    if ($ts -and ($ts.Trim() -match '^\d+$')) {
+        return [DateTimeOffset]::FromUnixTimeSeconds([int64]$ts.Trim()).LocalDateTime
+    }
+    return $null
+}
+
+# Apply creation + write timestamps to a file
+function Set-FileDate {
+    param([string]$path, [datetime]$dt)
+    try {
+        [IO.File]::SetCreationTime($path, $dt)
+        [IO.File]::SetLastWriteTime($path, $dt)
+    } catch {}
+}
+
+# Find existing file in a directory matching *[id].ext regardless of prefix/title
+function Find-ByVideoId {
+    param([string]$dir, [string]$id, [string]$ext)
+    Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*[$id]$ext" } |
+        Select-Object -First 1
 }
 
 function Get-Captions {
@@ -227,7 +274,6 @@ function Get-Captions {
 
     # PASS 1 — default client
     & yt-dlp @commonArgs 2>&1 | Out-Null
-
     $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue | Select-Object -First 1
 
     # PASS 2 — android client fallback
@@ -320,25 +366,19 @@ function Get-Outline {
 
     $userMsg = $OutlinePrompt + "`n`n--- TRANSCRIPT START ---`n$raw`n--- TRANSCRIPT END ---"
 
-    # Serialize via .NET JsonSerializer to handle em-dashes, smart quotes,
-    # and other non-ASCII cleanly across all PowerShell versions.
-    $bodyObj = [ordered]@{
-        model    = $Model
-        stream   = $false
-        options  = [ordered]@{ num_ctx = 131072 }
-        messages = @(
-            [ordered]@{ role = "user";      content = $userMsg }
-            [ordered]@{ role = "assistant"; content = "# Content Brief:" }
-        )
+    function EscapeJson([string]$s) {
+        $s.Replace('\',  '\\').
+           Replace('"',  '\"').
+           Replace("`n", '\n').
+           Replace("`r", '\r').
+           Replace("`t", '\t')
     }
 
-    # PS 5.1 ConvertTo-Json has a known bug with long strings containing
-    # certain unicode chars. Use .NET's JavaScriptSerializer instead.
-    Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
-    $jss = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-    $jss.MaxJsonLength = [int]::MaxValue
+    $sysPrompt = EscapeJson $userMsg
+    $asstPrime = EscapeJson "# Content Brief:"
+    $modelEsc  = EscapeJson $Model
 
-    $bodyJson  = $jss.Serialize($bodyObj)
+    $bodyJson  = '{"model":"' + $modelEsc + '","stream":false,"options":{"num_ctx":131072},"messages":[{"role":"user","content":"' + $sysPrompt + '"},{"role":"assistant","content":"' + $asstPrime + '"}]}'
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
 
     try {
@@ -363,19 +403,31 @@ function Get-Outline {
 
 # ─────────────────────────────────────────
 # BUILD VIDEO LIST
+# yt-dlp returns newest-first; assign positions oldest-first (1 = oldest)
 # ─────────────────────────────────────────
 
-$videos = $json.entries | ForEach-Object {
+$allEntries = @($json.entries | ForEach-Object {
+    [PSCustomObject]@{ Id = $_.id; Title = $_.title }
+})
+
+$total = $allEntries.Count
+
+# Reverse to get oldest-first, assign 1-based positions
+$withPos = for ($i = 0; $i -lt $total; $i++) {
     [PSCustomObject]@{
-        Id    = $_.id
-        Title = $_.title
+        Id       = $allEntries[$total - 1 - $i].Id
+        Title    = $allEntries[$total - 1 - $i].Title
+        Position = $i + 1
     }
 }
 
-if ($Oldest) { [array]::Reverse($videos) }
+# Default processing order: newest first (reverse of withPos)
+$videos = $withPos[$($total - 1)..0]
+
+if ($Oldest) { $videos = $withPos }
 if ($Limit -gt 0) { $videos = $videos | Select-Object -First $Limit }
 
-Write-Host "Videos found: $($videos.Count)" -ForegroundColor Cyan
+Write-Host "Videos found: $total" -ForegroundColor Cyan
 
 # ─────────────────────────────────────────
 # MAIN LOOP
@@ -387,22 +439,46 @@ foreach ($v in $videos) {
 
     Write-Host "`n$($v.Title)" -ForegroundColor Yellow
 
-    $safe = Sanitize $v.Title
+    $pos      = Format-Position $v.Position $total
+    $stripped = Strip-ChannelPrefix (Sanitize $v.Title) $channelName
+    $safe     = Sanitize $stripped
+    $stem     = "$pos $safe [$($v.Id)]"
 
-    $txt = Join-Path $TranscriptsDir "$safe [$($v.Id)].txt"
-    $md  = Join-Path $OutlinesDir    "$safe [$($v.Id)].md"
+    $txt = Join-Path $TranscriptsDir "$stem.txt"
+    $md  = Join-Path $OutlinesDir    "$stem.md"
 
-    if (-not $Force -and (Test-Path -LiteralPath $txt) -and (Test-Path -LiteralPath $md)) {
-        Write-Host "  -> Skipping (exists)" -ForegroundColor DarkGray
-        continue
+    # ID-based lookup
+    $existingTxt = Find-ByVideoId $TranscriptsDir $v.Id ".txt"
+    $existingMd  = Find-ByVideoId $OutlinesDir    $v.Id ".md"
+
+    # ── RENAME NORMALIZATION ──
+
+    if ($existingTxt -and $existingTxt.FullName -ne $txt) {
+        Write-Host "  -> Renaming transcript" -ForegroundColor DarkGray
+        Rename-Item -LiteralPath $existingTxt.FullName -NewName "$stem.txt" -ErrorAction SilentlyContinue
+        $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
     }
+
+    if ($existingMd -and $existingMd.FullName -ne $md) {
+        Write-Host "  -> Renaming outline" -ForegroundColor DarkGray
+        Rename-Item -LiteralPath $existingMd.FullName -NewName "$stem.md" -ErrorAction SilentlyContinue
+        $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
+    }
+
+    # ── DRY RUN ──
 
     if ($DryRun) {
-        Write-Host "  -> DryRun" -ForegroundColor DarkGray
+        Write-Host "  -> DryRun: $stem" -ForegroundColor DarkGray
         continue
     }
 
-    if (-not (Test-Path -LiteralPath $txt)) {
+    # ── ALWAYS RESOLVE DATE (for full retroactive normalization) ──
+
+    $uploadDt = Get-UploadDate $v.Id
+
+    # ── TRANSCRIPT ──
+
+    if (-not $existingTxt -or $Force) {
 
         $ok = $false
 
@@ -424,16 +500,45 @@ foreach ($v in $videos) {
             Write-Host "  -> Failed (no transcript)" -ForegroundColor Red
             continue
         }
+
+        $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
+        Write-Host "  -> Transcript saved" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  -> Using existing transcript" -ForegroundColor DarkGray
     }
 
-    if (-not (Test-Path -LiteralPath $md)) {
+    # ── OUTLINE ──
+
+    if (-not $existingMd -or $Force) {
+
         Write-Host "  -> Outline..." -ForegroundColor Cyan
 
         if (Get-Outline $txt $md) {
             Write-Host "  -> Saved" -ForegroundColor Green
-        } else {
+            $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
+        }
+        else {
             Write-Host "  -> Outline skipped/failed" -ForegroundColor DarkGray
         }
+    }
+    else {
+        Write-Host "  -> Using existing outline" -ForegroundColor DarkGray
+    }
+
+    # ── FULL RETROACTIVE DATE NORMALIZATION ──
+
+    if ($uploadDt) {
+
+        if ($existingTxt -and (Test-Path -LiteralPath $existingTxt.FullName)) {
+            Set-FileDate $existingTxt.FullName $uploadDt
+        }
+
+        if ($existingMd -and (Test-Path -LiteralPath $existingMd.FullName)) {
+            Set-FileDate $existingMd.FullName $uploadDt
+        }
+
+        Write-Host "  -> Dated: $($uploadDt.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
     }
 
     $processed++
@@ -442,4 +547,4 @@ foreach ($v in $videos) {
 # Cleanup temp
 Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-Write-Host "`nDone: $processed / $($videos.Count)" -ForegroundColor Cyan
+Write-Host "`nDone: $processed / $total" -ForegroundColor Cyan
