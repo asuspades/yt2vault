@@ -1,14 +1,16 @@
 # config.local.ps1 - Copy to config.local.ps1 and edit (gitignored)
-# Used by yt2txt.ps1 and playlist2vault.ps1
+# Paths are resolved: env vars → this file → script defaults
 
 $script:ConfigOverride = @{
-    # yt2txt.ps1 paths
-    DownloadDir    = "C:\Users\You\Videos\YouTube"
-    WhisperDir     = "C:\Users\You\Documents\Whisper"
-    TranscriberPath = "C:\Users\You\scripts\Transcribe-GPU.ps1"
-    RumbleDir      = "C:\Users\You\Videos\Rumble"  # optional host override
+    # Core output paths
+    TranscriptRoot = "D:\Archives\YouTube\Transcripts"
+    ObsidianRoot   = "C:\Users\You\Obsidian\Vaults\Youtube Channel Vault"
+    
+    # Whisper helper paths
+    Yt2TxtScript   = "C:\tools\yt2txt.ps1"
+    WhisperDir     = "E:\AI\Whisper"
+    AudioDir       = "D:\Media\YouTube"
     
     # Runtime config
-    NodeRuntime    = "node"  # or "node:C:\Program Files\nodejs\node.exe"
-    CookieBrowser  = "firefox"
+    NodeExe        = "node"  # Or full path: "node:C:\Program Files\nodejs\node.exe"
 }
