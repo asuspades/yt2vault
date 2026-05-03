@@ -245,12 +245,39 @@ function Set-FileDate {
     } catch {}
 }
 
-# Find existing file in a directory matching *[id].ext regardless of prefix/title
+# Find existing file in a directory matching *[id].ext regardless of prefix/title.
+# Uses regex with [regex]::Escape() to safely handle IDs containing special chars like '-'.
+# Optional $preferStem: if provided, prefers exact target filename first.
 function Find-ByVideoId {
-    param([string]$dir, [string]$id, [string]$ext)
-    Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "*[$id]$ext" } |
-        Select-Object -First 1
+    param(
+        [string]$dir,
+        [string]$id,
+        [string]$ext,
+        [string]$preferStem = ""
+    )
+    
+    # Regex-escape both ID and extension to prevent misinterpretation of special chars
+    $escapedId = [regex]::Escape($id)
+    $escapedExt = [regex]::Escape($ext)
+    
+    # Match files ending exactly with [id].ext (case-sensitive, anchored to end)
+    $pattern = "\[$escapedId\]$escapedExt$"
+    $matches = @(Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $pattern })
+
+    if ($matches.Count -eq 0) { return $null }
+
+    # Prefer exact target name if provided and present
+    if ($preferStem) {
+        $exact = $matches | Where-Object { $_.BaseName -eq $preferStem }
+        if ($exact) { return $exact | Select-Object -First 1 }
+    }
+
+    # If duplicates exist, prefer the one that already has a numeric prefix (^\d+\s)
+    $numbered = $matches | Where-Object { $_.Name -match '^\d+\s' }
+    if ($numbered) { return $numbered | Select-Object -First 1 }
+
+    return $matches | Select-Object -First 1
 }
 
 function Get-Captions {
@@ -447,22 +474,38 @@ foreach ($v in $videos) {
     $txt = Join-Path $TranscriptsDir "$stem.txt"
     $md  = Join-Path $OutlinesDir    "$stem.md"
 
-    # ID-based lookup
-    $existingTxt = Find-ByVideoId $TranscriptsDir $v.Id ".txt"
-    $existingMd  = Find-ByVideoId $OutlinesDir    $v.Id ".md"
+    # ID-based lookup with preferStem for unambiguous matching (IMPROVEMENT #1 & #3)
+    $existingTxt = Find-ByVideoId $TranscriptsDir $v.Id ".txt" $stem
+    $existingMd  = Find-ByVideoId $OutlinesDir    $v.Id ".md"  $stem
 
-    # ── RENAME NORMALIZATION ──
+    # ── RENAME NORMALIZATION + DUPLICATE CLEANUP (IMPROVEMENT #2) ──
 
     if ($existingTxt -and $existingTxt.FullName -ne $txt) {
         Write-Host "  -> Renaming transcript" -ForegroundColor DarkGray
         Rename-Item -LiteralPath $existingTxt.FullName -NewName "$stem.txt" -ErrorAction SilentlyContinue
         $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
+        # Remove stale duplicates with same ID left over from pre-numbering runs
+        $escapedId = [regex]::Escape($v.Id)
+        Get-ChildItem -LiteralPath $TranscriptsDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "\[$escapedId\]\.txt$" -and $_.FullName -ne $txt } |
+            ForEach-Object { 
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Write-Host "  -> Removed duplicate transcript: $($_.Name)" -ForegroundColor DarkGray 
+            }
     }
 
     if ($existingMd -and $existingMd.FullName -ne $md) {
         Write-Host "  -> Renaming outline" -ForegroundColor DarkGray
         Rename-Item -LiteralPath $existingMd.FullName -NewName "$stem.md" -ErrorAction SilentlyContinue
         $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
+        # Remove stale duplicates with same ID left over from pre-numbering runs
+        $escapedId = [regex]::Escape($v.Id)
+        Get-ChildItem -LiteralPath $OutlinesDir -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "\[$escapedId\]\.md$" -and $_.FullName -ne $md } |
+            ForEach-Object { 
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Write-Host "  -> Removed duplicate outline: $($_.Name)" -ForegroundColor DarkGray 
+            }
     }
 
     # ── DRY RUN ──
@@ -471,10 +514,6 @@ foreach ($v in $videos) {
         Write-Host "  -> DryRun: $stem" -ForegroundColor DarkGray
         continue
     }
-
-    # ── ALWAYS RESOLVE DATE (for full retroactive normalization) ──
-
-    $uploadDt = Get-UploadDate $v.Id
 
     # ── TRANSCRIPT ──
 
@@ -528,16 +567,14 @@ foreach ($v in $videos) {
 
     # ── FULL RETROACTIVE DATE NORMALIZATION ──
 
+    $uploadDt = Get-UploadDate $v.Id
     if ($uploadDt) {
-
         if ($existingTxt -and (Test-Path -LiteralPath $existingTxt.FullName)) {
             Set-FileDate $existingTxt.FullName $uploadDt
         }
-
         if ($existingMd -and (Test-Path -LiteralPath $existingMd.FullName)) {
             Set-FileDate $existingMd.FullName $uploadDt
         }
-
         Write-Host "  -> Dated: $($uploadDt.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
     }
 
