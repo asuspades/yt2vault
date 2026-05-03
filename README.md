@@ -18,9 +18,10 @@
 - 📁 **Obsidian-Ready**: Outputs clean `.md` files organized by `Channel/Collection/Video`
 - 🔢 **Positional Filenames**: Files named `01 Title [ID].txt` for correct chronological sorting
 - 🕐 **Timestamp Normalization**: File creation/modification dates set to YouTube upload date
-- 🔁 **Rename Resilience**: Skip logic matches by video ID — survives YouTube title changes
+- 🔁 **Rename-Resilient Matching**: Video ID-based lookup with **regex-safe escaping** — survives YouTube title changes and handles IDs with special characters (`-`, `_`, etc.)
+- 🧹 **Auto-Duplicate Cleanup**: Removes stale unnumbered files from pre-numbering runs during rename normalization
 - ⚡ **Incremental Processing**: Skips processed videos unless `-Force` is used
-- 🔒 **Privacy-Aware**: All processing happens locally; no external APIs required
+- 🔒 **Privacy-Aware**: All processing happens locally; no external APIs required; **zero hardcoded paths**
 
 ---
 
@@ -46,9 +47,10 @@ YouTube Source (Playlist or Channel /streams, /videos, /shorts)
         └─► Optional: Send transcript to Ollama → Generate "Content Brief" .md
              └─► Save to: $ObsidianRoot/Channel/Collection/Video [ID].md
 
-        After processing:
-        └─► Set file timestamps to match YouTube upload date
-        └─► Rename existing files if video title changed (ID-based matching)
+        Post-processing:
+        ├─► Set file timestamps to match YouTube upload date
+        ├─► Rename existing files if video title changed (regex-safe ID matching)
+        └─► Clean up duplicate files with same ID from legacy runs
 ```
 
 ---
@@ -73,13 +75,13 @@ YouTube Source (Playlist or Channel /streams, /videos, /shorts)
 ### 1. Clone the Repo
 
 ```powershell
-git clone https://github.com/yourname/playlist2vault.git
+git clone https://github.com/asuspades/playlist2vault.git
 cd playlist2vault
 ```
 
 ### 2. Configure Paths (Choose One)
 
-#### Option A: Environment Variables (Recommended)
+#### Option A: Environment Variables (Recommended for CI/automation)
 Add to your `$PROFILE` or system environment variables:
 ```powershell
 # Core paths
@@ -95,7 +97,7 @@ $env:PV_AUDIO_DIR   = "D:\Media\YouTube"
 $env:PV_NODE_EXE    = "node"  # Assumes node.exe is in $env:PATH
 ```
 
-#### Option B: Local Config File (Git-Ignored)
+#### Option B: Local Config File (Git-Ignored — Recommended for personal use)
 ```powershell
 # Copy the example template
 Copy-Item config.local.ps1.example config.local.ps1
@@ -111,7 +113,7 @@ $script:ConfigOverride = @{
 }
 ```
 
-> 📁 Both `playlist2vault.ps1` and `helpers/yt2txt.ps1` share the same config system.
+> 📁 Both `playlist2vault.ps1` and `helpers/yt2txt.ps1` share the same config system via `config.local.ps1` (automatically gitignored).
 
 ### 3. Run the Script
 
@@ -150,7 +152,7 @@ $script:ConfigOverride = @{
 | `-Oldest` | `switch` | `$false` | Process oldest videos first (default: newest) |
 | `-Force` | `switch` | `$false` | Re-process videos even if outputs exist |
 | `-NoOutline` | `switch` | `$false` | Skip LLM outline generation |
-| `-UseWhisper` | `switch` | `$false` | Skip captions; use Whisper directly |
+| `-UseWhisper` | `switch` | `$false` | Skip captions; use Whisper directly *(deprecated: captions always tried first)* |
 | `-NoWhisperFallback` | `switch` | `$false` | Disable Whisper fallback if captions fail |
 | `-CookieBrowser` | `string` | `"firefox"` | Browser for cookie auth: `firefox`, `chrome`, `edge`, `safari`, `brave` |
 | `-DryRun` | `switch` | `$false` | Show what would be processed (no writes) |
@@ -178,13 +180,15 @@ $script:ConfigOverride = @{
 ```
 - **Position**: Zero-padded based on total count (`01`, `02`, ... `10`) for correct lexical sorting
 - **Title**: Sanitized (invalid chars removed) + channel prefix stripped
-- **ID**: YouTube video ID in brackets — enables rename resilience
+- **ID**: YouTube video ID in brackets — enables rename resilience and regex-safe matching
 
 ### Key Behaviors
-> ✅ **Rename Resilience**: Files are matched by `[ID]` — if a video title changes on YouTube, existing files are auto-renamed to the new canonical name  
+> ✅ **Regex-Safe ID Matching**: Video IDs are escaped with `[regex]::Escape()` before file lookup — prevents mis-matching IDs containing special characters like `-` (e.g., `1ywSf4Gt-kY` → `1ywSf4Gt\-kY`)  
+> ✅ **Prefer-Exact-Stem Lookup**: When multiple files share the same `[ID]`, the script prioritizes the file matching the exact target filename, then numbered files, then first-found  
+> ✅ **Auto-Duplicate Cleanup**: After renaming a file to the canonical `position title [ID].ext` format, any remaining stale files with the same ID are automatically removed  
 > ✅ **Timestamp Normalization**: File creation/modification dates are set to the video's YouTube upload date for chronological sorting  
 > ✅ **Independent Outputs**: Transcripts (`.txt`) and outlines (`.md`) are saved separately — you can re-run with `-NoOutline` to regenerate only outlines  
-> ✅ **Skip Logic**: Existing files are skipped unless `-Force` is passed
+> ✅ **Skip Logic**: Existing files are skipped unless `-Force` is passed  
 
 ---
 
@@ -238,11 +242,20 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 - 🍪 Browser cookies are used *only* by `yt-dlp` for authentication; never stored or transmitted by this script
 - 🧹 Temporary files are written to `$env:TEMP\vault_{GUID}` and cleaned up post-run
 - 🤖 Ollama requests go to `http://127.0.0.1:11434` — fully local, no cloud dependency
-- 🚫 **Before contributing**: Run a quick leak check:
+- 🛡️ **Regex-Safe File Operations**: Video IDs are escaped before use in file pattern matching — prevents accidental operations on wrong files due to special characters in IDs
+- 🚫 **Before contributing**: Run the leak checker to ensure no personal paths are committed:
   ```powershell
-  # Scan for hardcoded personal paths
-  Select-String -Path .\*.ps1 -Pattern "C:\\Users\\[^\\]+\\|OneDrive" -CaseSensitive
+  # Scan for hardcoded personal paths, usernames, or absolute C:\ paths
+  Select-String -Path .\*.ps1 -Pattern "C:\\Users\\[^\\]+\\|OneDrive|\\Users\\[a-zA-Z]+" -CaseSensitive
   ```
+
+### Configuration Security Model
+Paths are resolved in this order (highest precedence first):
+1. **Environment Variables** (`$env:PV_*`) — ideal for CI/automation, never committed
+2. **Local Config** (`config.local.ps1`) — gitignored by default, for personal overrides
+3. **Safe Defaults** — relative to script root or user Documents folder
+
+> ✅ This ensures the script is **GitHub-safe by default**: no hardcoded usernames, no absolute paths, no secrets in source.
 
 ---
 
@@ -257,7 +270,8 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 | `Ollama error: Connection refused` | Start Ollama first: `ollama serve`; verify model: `ollama pull gemma3:27b` |
 | `Node.js runtime error` | Ensure Node is installed and accessible; set `$env:PV_NODE_EXE = "node"` or full path like `node:C:\Program Files\nodejs\node.exe` |
 | Files not sorting chronologically | Ensure your file explorer/Obsidian is sorting by "Date created" or "Date modified" — the script sets these to YouTube upload date |
-| Existing files not being renamed | The script matches by `[VIDEO_ID]` — if you manually renamed files, restore the `[ID]` suffix for auto-renaming to work |
+| Existing files not being renamed | The script matches by `[VIDEO_ID]` using regex-safe escaping — if you manually renamed files, restore the `[ID]` suffix for auto-renaming to work |
+| Duplicate files with same ID appearing | The script auto-cleans duplicates after rename; if you see leftovers, they may be from a pre-v1.2 run — manual deletion is safe |
 
 ---
 
@@ -268,7 +282,8 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 3. Test changes with `-DryRun` first
 4. Run the leak checker before pushing:
    ```powershell
-   Select-String -Path .\*.ps1 -Pattern "C:\\Users\\[^\\]+\\|OneDrive" -CaseSensitive
+   # Scan for hardcoded personal paths, usernames, or absolute paths
+   Select-String -Path .\*.ps1 -Pattern "C:\\Users\\[^\\]+\\|OneDrive|\\Users\\[a-zA-Z]+" -CaseSensitive
    ```
 5. Submit a PR with a clear description
 
@@ -280,6 +295,7 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 - [ ] Parallel video processing with `-ThrottleLimit`
 - [ ] Frontmatter injection for Obsidian (tags, aliases, upload date)
 - [ ] Support for other platforms (Rumble, Twitch VODs) via yt-dlp
+- [ ] Unit tests for `Find-ByVideoId` regex escaping edge cases
 
 ---
 
@@ -296,11 +312,13 @@ MIT © 2026. Free for personal and commercial use.
 >
 > **Chronological Browsing**: Because file timestamps match YouTube upload dates, you can sort your vault folder by "Date modified" to browse videos in true chronological order — even if you processed them out of sequence.
 >
-> **Re-run Safely**: Thanks to ID-based matching, you can re-run the script after renaming videos on YouTube — existing transcripts/outlines will be auto-renamed to match, no duplicates created.
+> **Re-run Safely**: Thanks to regex-safe ID-based matching, you can re-run the script after renaming videos on YouTube — existing transcripts/outlines will be auto-renamed to match, duplicates cleaned up, no data loss.
+>
+> **Migration from Pre-v1.2**: If you have unnumbered files from older runs, the script will auto-detect them by `[ID]`, rename to the new `position title [ID].ext` format, and clean up any duplicates. No manual intervention needed.
 
 ```markdown
 <!-- Add this badge to your Obsidian notes -->
-[![Source](https://img.shields.io/badge/Source-playlist2vault-blue?logo=github)](https://github.com/yourname/playlist2vault)
+[![Source](https://img.shields.io/badge/Source-playlist2vault-blue?logo=github)](https://github.com/asuspades/playlist2vault)
 ```
 
 ---
