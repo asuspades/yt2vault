@@ -1,16 +1,37 @@
 # config.local.ps1 - Copy to config.local.ps1 and edit (gitignored)
-# Paths are resolved: env vars → this file → script defaults
+# This file is automatically loaded by playlist2vault.ps1 if present
+
+# ─────────────────────────────────────────
+# 🔐 SECURITY REMINDER
+# ─────────────────────────────────────────
+# ⚠️ Never commit this file with real paths containing your username or personal data.
+#    Before committing, scan with:
+#    Select-String -Path config.local.ps1 -Pattern "Users\\[a-zA-Z]+|OneDrive" -CaseSensitive
+
+# ─────────────────────────────────────────
+# 🔄 Path Resolution Precedence
+# ─────────────────────────────────────────
+# Paths are resolved in this order (highest → lowest):
+#   1. Environment variables: $env:PV_OBSIDIAN, $env:PV_TRANSCRIPTS, etc.
+#   2. This file: $script:ConfigOverride hashtable (below)
+#   3. Script defaults: relative to $PSScriptRoot or user Documents folder
+#
+# 💡 Tip: Use -Normalize mode? Only TranscriptRoot/ObsidianRoot are required
+#         (no Whisper/Ollama calls are made)
 
 $script:ConfigOverride = @{
-    # Core output paths
-    TranscriptRoot = "D:\Archives\YouTube\Transcripts"
-    ObsidianRoot   = "C:\Users\You\Obsidian\Vaults\Youtube Channel Vault"
+    # ── REQUIRED: Core output paths ─────────────────────────────
+    # Use $env:USERPROFILE for portability across machines/users
+    TranscriptRoot = "$env:USERPROFILE\Documents\YouTube Transcripts"
+    ObsidianRoot   = "$env:USERPROFILE\Documents\Obsidian\Youtube Channel Vault"
     
-    # Whisper helper paths
-    Yt2TxtScript   = "C:\tools\yt2txt.ps1"
-    WhisperDir     = "E:\AI\Whisper"
-    AudioDir       = "D:\Media\YouTube"
+    # ── OPTIONAL: Whisper helper paths ──────────────────────────
+    # If omitted, script uses safe defaults relative to $PSScriptRoot
+    # Yt2TxtScript   = "$PSScriptRoot\helpers\yt2txt.ps1"
+    # WhisperDir     = "$PSScriptRoot\data\whisper"
+    # AudioDir       = "$PSScriptRoot\data\audio"
     
-    # Runtime config
-    NodeExe        = "node"  # Or full path: "node:C:\Program Files\nodejs\node.exe"
+    # ── OPTIONAL: Runtime config ────────────────────────────────
+    # NodeExe: "node" (uses PATH) OR "node:C:\full\path\node.exe"
+    # NodeExe        = "node"
 }
