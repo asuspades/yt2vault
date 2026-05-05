@@ -24,6 +24,7 @@
 - 🔄 **Normalize Mode**: `-Normalize` renames + restamps existing files only — never regenerates content (safe for bulk maintenance)
 - 🔒 **Privacy-Aware**: All processing happens locally; no external APIs required; **zero hardcoded paths**
 - 🛡️ **Hard Validation Gates**: Prevents false success messages and crashes when files fail to generate
+- 🪄 **One-Click Setup**: Fresh Windows install? Run `helpers/setup.ps1` to auto-install dependencies
 
 ---
 
@@ -88,16 +89,37 @@ YouTube Source (Playlist or Channel /streams, /videos, /shorts)
 
 ## 🚀 Quick Start
 
-### 1. Clone the Repo
+### 🪄 Option A: One-Click Setup (Windows, Fresh Install)
+
+```powershell
+# Run PowerShell as Administrator, then:
+iwr https://raw.githubusercontent.com/asuspades/playlist2vault/main/helpers/setup.ps1 -OutFile setup.ps1
+.\setup.ps1
+```
+
+This script will:
+- ✅ Check/update PowerShell execution policy
+- ✅ Install `yt-dlp`, `Node.js`, and `Git` via Winget (with manual fallbacks)
+- ✅ Clone the repo to `~\playlist2vault`
+- ✅ Scaffold `config.local.ps1` with sensible defaults
+- ✅ Verify all tools are working post-install
+
+> ⚠️ **Note**: Some installs may require you to **reopen PowerShell** for PATH changes to take effect.
+
+---
+
+### 🛠️ Option B: Manual Setup (All Platforms)
+
+#### 1. Clone the Repo
 
 ```powershell
 git clone https://github.com/asuspades/playlist2vault.git
 cd playlist2vault
 ```
 
-### 2. Configure Paths (Choose One)
+#### 2. Configure Paths (Choose One)
 
-#### Option A: Environment Variables (Recommended for CI/automation)
+##### Option A: Environment Variables (Recommended for CI/automation)
 Add to your `$PROFILE` or system environment variables:
 ```powershell
 # Core paths
@@ -113,7 +135,7 @@ $env:PV_AUDIO_DIR   = "D:\Media\YouTube"
 $env:PV_NODE_EXE    = "node"  # Assumes node.exe is in $env:PATH
 ```
 
-#### Option B: Local Config File (Git-Ignored — Recommended for personal use)
+##### Option B: Local Config File (Git-Ignored — Recommended for personal use)
 ```powershell
 # Copy the example template
 Copy-Item config.local.ps1.example config.local.ps1
@@ -131,7 +153,7 @@ $script:ConfigOverride = @{
 
 > 📁 Both `playlist2vault.ps1` and `helpers/yt2txt.ps1` share the same config system via `config.local.ps1` (automatically gitignored).
 
-### 3. Run the Script
+#### 3. Run the Script
 
 ```powershell
 # Process a playlist (URL or raw ID)
@@ -217,15 +239,17 @@ $script:ConfigOverride = @{
 
 ---
 
-## 🧰 Helper Script: `helpers/yt2txt.ps1`
+## 🧰 Helper Scripts
 
-This optional helper handles Whisper transcription fallback when YouTube captions aren't available.
+### `helpers/yt2txt.ps1` — Whisper Transcription Fallback
 
-### When It Runs
+This optional helper handles Whisper transcription when YouTube captions aren't available.
+
+#### When It Runs
 - Automatically invoked by `playlist2vault.ps1` when caption download fails (unless `-NoWhisperFallback`)
 - Can also be run standalone for one-off transcription tasks
 
-### Standalone Usage
+#### Standalone Usage
 ```powershell
 # Basic transcription
 .\helpers\yt2txt.ps1 -Url "https://youtube.com/watch?v=ABC123"
@@ -242,7 +266,7 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 .\helpers\yt2txt.ps1 -Url "https://youtube.com/watch?v=ABC123" -CookieBrowser chrome
 ```
 
-### Parameters
+#### Parameters
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-Url` | *(required)* | YouTube or Rumble video URL |
@@ -257,7 +281,31 @@ This optional helper handles Whisper transcription fallback when YouTube caption
 | `-NoVAD` | `$false` | Skip voice activity detection pre-processing |
 | `-WordTimestamps` | `$false` | Include word-level timestamps in output |
 
-> 🔗 See `config.local.ps1.example` for shared configuration between both scripts.
+---
+
+### `helpers/setup.ps1` — Windows Dependency Installer
+
+> 🪄 **New users on Windows**: Start here.
+
+Automates the setup of `playlist2vault` on a fresh Windows installation.
+
+#### What It Does
+- ✅ Checks and updates PowerShell execution policy (`RemoteSigned`)
+- ✅ Detects or installs Winget (with manual fallback instructions)
+- ✅ Installs required tools: `yt-dlp`, `Node.js`, `Git`
+- ✅ Clones the repo to `~\playlist2vault`
+- ✅ Scaffolds `config.local.ps1` from template (or creates minimal config)
+- ✅ Verifies all tools are in PATH and working
+- ✅ Prints clear next-step instructions
+
+#### Usage
+```powershell
+# Run PowerShell as Administrator (recommended)
+iwr https://raw.githubusercontent.com/asuspades/playlist2vault/main/helpers/setup.ps1 -OutFile setup.ps1
+.\setup.ps1
+```
+
+> 💡 **Tip**: If installs succeed but commands aren't found, **close and reopen PowerShell** to refresh your PATH.
 
 ---
 
@@ -299,6 +347,8 @@ Paths are resolved in this order (highest precedence first):
 | Duplicate files with same ID appearing | The script auto-cleans duplicates after rename; if you see leftovers, they may be from a pre-v1.2 run — manual deletion is safe |
 | `ERROR: transcript not found after generation` | Check disk space, permissions, or antivirus interference; retry with `-Force` or inspect `helpers/yt2txt.ps1` output |
 | `Normalize: 0 renamed, 0 restamped` | Files may already be in canonical format with correct timestamps; use `-DryRun` to preview what would change |
+| `setup.ps1` fails at Winget step | Winget may not be installed on your Windows version. Follow the manual install links printed by the script, or install via Scoop: `iwr -useb get.scoop.sh \| iex` |
+| Commands not found after setup | PATH changes may require a new PowerShell session. Close and reopen your terminal, or run `refreshenv` if using Chocolatey. |
 
 ---
 
@@ -324,6 +374,7 @@ Paths are resolved in this order (highest precedence first):
 - [ ] Support for other platforms (Rumble, Twitch VODs) via yt-dlp
 - [ ] Unit tests for `Find-ByVideoId` regex escaping edge cases
 - [ ] `-Normalize` dry-run summary report (what would be renamed/restamped)
+- [ ] `setup.sh` for WSL/Linux/macOS parity with `helpers/setup.ps1`
 
 ---
 
@@ -345,6 +396,8 @@ MIT © 2026. Free for personal and commercial use.
 > **Migration from Pre-v1.2**: If you have unnumbered files from older runs, the script will auto-detect them by `[ID]`, rename to the new `position title [ID].ext` format, and clean up any duplicates. No manual intervention needed.
 >
 > **Bulk Maintenance with `-Normalize`**: Use `-Normalize` to fix naming + timestamps across your entire vault without re-downloading or re-transcribing. Combine with `-DryRun` first to preview changes. Safe, fast, and idempotent.
+>
+> **Fresh Windows Install?**: Skip manual setup — run `helpers/setup.ps1` to auto-install dependencies and scaffold your config.
 
 ```markdown
 <!-- Add this badge to your Obsidian notes -->
