@@ -1,34 +1,55 @@
-# Local config override (users create their own)
+# ─────────────────────────────────────────
+# 🔐 Local config & secrets (NEVER commit)
+# ─────────────────────────────────────────
 config.local.ps1
 *.local.*
 .env
+*.secrets.*
 
-# Runtime data
+# ─────────────────────────────────────────
+# 🗃️ Runtime cache & intermediates (safe to ignore)
+# ─────────────────────────────────────────
+# Whisper/audio cache
 data/
+audio/
+whisper/
+
+# Temporary processing files (script uses $env:TEMP, but be safe)
 temp/
-*.log
-*.vtt
-*.txt
-*.md
-*.mp3
+.tmp/
+*.tmp
 
-# OS / editor
+# Intermediate caption files (regenerable)
+*.vtt
+
+# Logs
+*.log
+logs/
+
+# ─────────────────────────────────────────
+# 🖥️ OS / Editor / Tooling
+# ─────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .vscode/
-*.ps1xml# Local config (users create their own)
-config.local.ps1
-*.local.*
-.env
+.idea/
+*.ps1xml
+*.suo
+*.user
 
-# Runtime data
-data/
-*.mp3
-*.txt
-*.vtt
-*.log
+# ─────────────────────────────────────────
+# 🐍 Python helpers (if used)
+# ─────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env.local
 
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
+# ─────────────────────────────────────────
+# 📦 Build / Distribution (if ever needed)
+# ─────────────────────────────────────────
+dist/
+build/
+*.zip
+*.tar.gz
