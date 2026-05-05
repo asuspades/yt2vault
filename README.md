@@ -21,7 +21,9 @@
 - 🔁 **Rename-Resilient Matching**: Video ID-based lookup with **regex-safe escaping** — survives YouTube title changes and handles IDs with special characters (`-`, `_`, etc.)
 - 🧹 **Auto-Duplicate Cleanup**: Removes stale unnumbered files from pre-numbering runs during rename normalization
 - ⚡ **Incremental Processing**: Skips processed videos unless `-Force` is used
+- 🔄 **Normalize Mode**: `-Normalize` renames + restamps existing files only — never regenerates content (safe for bulk maintenance)
 - 🔒 **Privacy-Aware**: All processing happens locally; no external APIs required; **zero hardcoded paths**
+- 🛡️ **Hard Validation Gates**: Prevents false success messages and crashes when files fail to generate
 
 ---
 
@@ -38,14 +40,28 @@ YouTube Source (Playlist or Channel /streams, /videos, /shorts)
                      │
                      ▼
         For each video:
-        ├─► Try: Download English auto-captions (.vtt)
-        │    └─► Convert VTT → clean .txt transcript
         │
-        ├─► Fallback: Run helpers/yt2txt.ps1 → Whisper transcription
-        │    └─► Output: .txt transcript
+        ├─► [Normalize Mode?] ──► Rename files to canonical format
+        │                        │
+        │                        ├─► Remove duplicate files with same [ID]
+        │                        │
+        │                        └─► Restamp timestamps to YouTube upload date
+        │                        └─► Skip content generation entirely
         │
-        └─► Optional: Send transcript to Ollama → Generate "Content Brief" .md
-             └─► Save to: $ObsidianRoot/Channel/Collection/Video [ID].md
+        └─► [Normal Mode]
+             │
+             ├─► Try: Download English auto-captions (.vtt)
+             │    └─► Convert VTT → clean .txt transcript
+             │    └─► 🔴 Hard validation: confirm file exists
+             │
+             ├─► Fallback: Run helpers/yt2txt.ps1 → Whisper transcription
+             │    └─► Track files before/after for reliable detection
+             │    └─► Output: .txt transcript
+             │
+             ├─► 🔴 Pre-outline gate: skip if transcript missing
+             │
+             └─► Optional: Send transcript to Ollama → Generate "Content Brief" .md
+                  └─► Save to: $ObsidianRoot/Channel/Collection/Video [ID].md
 
         Post-processing:
         ├─► Set file timestamps to match YouTube upload date
@@ -138,6 +154,12 @@ $script:ConfigOverride = @{
 
 # Dry run: see what would be processed without writing files
 .\playlist2vault.ps1 -Source PL... -DryRun
+
+# 🔄 Normalize mode: rename + restamp existing files only (no regeneration)
+.\playlist2vault.ps1 -Source PL... -Normalize
+
+# Normalize with dry-run to preview changes
+.\playlist2vault.ps1 -Source PL... -Normalize -DryRun
 ```
 
 ---
@@ -156,6 +178,7 @@ $script:ConfigOverride = @{
 | `-NoWhisperFallback` | `switch` | `$false` | Disable Whisper fallback if captions fail |
 | `-CookieBrowser` | `string` | `"firefox"` | Browser for cookie auth: `firefox`, `chrome`, `edge`, `safari`, `brave` |
 | `-DryRun` | `switch` | `$false` | Show what would be processed (no writes) |
+| `-Normalize` | `switch` | `$false` | **Maintenance mode**: rename files to canonical format + restamp timestamps; never regenerates transcripts or outlines |
 
 ---
 
@@ -189,6 +212,8 @@ $script:ConfigOverride = @{
 > ✅ **Timestamp Normalization**: File creation/modification dates are set to the video's YouTube upload date for chronological sorting  
 > ✅ **Independent Outputs**: Transcripts (`.txt`) and outlines (`.md`) are saved separately — you can re-run with `-NoOutline` to regenerate only outlines  
 > ✅ **Skip Logic**: Existing files are skipped unless `-Force` is passed  
+> ✅ **Hard Validation Gates**: Transcript generation confirms file existence before proceeding; outline generation skips if transcript is missing — prevents crashes and false success messages  
+> ✅ **Normalize Mode**: When `-Normalize` is used, the script only renames existing files to the canonical format and restamps timestamps — no network calls, no transcription, no LLM usage. Safe for bulk maintenance.
 
 ---
 
@@ -272,6 +297,8 @@ Paths are resolved in this order (highest precedence first):
 | Files not sorting chronologically | Ensure your file explorer/Obsidian is sorting by "Date created" or "Date modified" — the script sets these to YouTube upload date |
 | Existing files not being renamed | The script matches by `[VIDEO_ID]` using regex-safe escaping — if you manually renamed files, restore the `[ID]` suffix for auto-renaming to work |
 | Duplicate files with same ID appearing | The script auto-cleans duplicates after rename; if you see leftovers, they may be from a pre-v1.2 run — manual deletion is safe |
+| `ERROR: transcript not found after generation` | Check disk space, permissions, or antivirus interference; retry with `-Force` or inspect `helpers/yt2txt.ps1` output |
+| `Normalize: 0 renamed, 0 restamped` | Files may already be in canonical format with correct timestamps; use `-DryRun` to preview what would change |
 
 ---
 
@@ -296,6 +323,7 @@ Paths are resolved in this order (highest precedence first):
 - [ ] Frontmatter injection for Obsidian (tags, aliases, upload date)
 - [ ] Support for other platforms (Rumble, Twitch VODs) via yt-dlp
 - [ ] Unit tests for `Find-ByVideoId` regex escaping edge cases
+- [ ] `-Normalize` dry-run summary report (what would be renamed/restamped)
 
 ---
 
@@ -315,6 +343,8 @@ MIT © 2026. Free for personal and commercial use.
 > **Re-run Safely**: Thanks to regex-safe ID-based matching, you can re-run the script after renaming videos on YouTube — existing transcripts/outlines will be auto-renamed to match, duplicates cleaned up, no data loss.
 >
 > **Migration from Pre-v1.2**: If you have unnumbered files from older runs, the script will auto-detect them by `[ID]`, rename to the new `position title [ID].ext` format, and clean up any duplicates. No manual intervention needed.
+>
+> **Bulk Maintenance with `-Normalize`**: Use `-Normalize` to fix naming + timestamps across your entire vault without re-downloading or re-transcribing. Combine with `-DryRun` first to preview changes. Safe, fast, and idempotent.
 
 ```markdown
 <!-- Add this badge to your Obsidian notes -->
