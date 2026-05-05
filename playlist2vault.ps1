@@ -14,6 +14,7 @@
     - Saves transcripts locally
     - Saves outlines to Obsidian Channel Vault
     - Skips existing files unless -Force
+    - Normalize mode: rename + restamp existing files only; never regenerates content
 
 .REQUIRES
     yt-dlp, browser cookies, Node.js, Ollama (optional), Whisper (optional)
@@ -39,6 +40,7 @@ param(
     [switch]$UseWhisper,
     [switch]$NoWhisperFallback,
     [switch]$DryRun,
+    [switch]$Normalize,   # Rename + restamp existing files only; never regenerates content
 
     [ValidateSet('firefox','chrome','edge','safari','brave')]
     [string]$CookieBrowser = 'firefox'
@@ -256,12 +258,11 @@ function Find-ByVideoId {
         [string]$preferStem = ""
     )
     
-    # Regex-escape both ID and extension to prevent misinterpretation of special chars
+    # Regex-escape ID to prevent misinterpretation of special chars
     $escapedId = [regex]::Escape($id)
-    $escapedExt = [regex]::Escape($ext)
     
-    # Match files ending exactly with [id].ext (case-sensitive, anchored to end)
-    $pattern = "\[$escapedId\]$escapedExt$"
+    # Match files containing [id] anywhere in name (flexible for legacy files)
+    $pattern = "\[$escapedId\]"
     $matches = @(Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match $pattern })
 
@@ -295,25 +296,34 @@ function Get-Captions {
         '--ignore-no-formats-error',
         '--no-warnings',
         '--socket-timeout',       '30',
+        '--sleep-requests',       '1',
         '-o',                     "$TempDir\$id",
         "https://www.youtube.com/watch?v=$id"
     )
 
     # PASS 1 — default client
     & yt-dlp @commonArgs 2>&1 | Out-Null
-    $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue |
+           Sort-Object LastWriteTime -Descending |
+           Select-Object -First 1
 
-    # PASS 2 — android client fallback
+    # PASS 2 — android + safari fallback
     if (-not $vtt) {
-        & yt-dlp @commonArgs '--extractor-args' 'youtube:player_client=android' 2>&1 | Out-Null
-        $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue | Select-Object -First 1
+        & yt-dlp @commonArgs '--extractor-args' 'youtube:player_client=android,web_safari' 2>&1 | Out-Null
+
+        $vtt = Get-ChildItem $TempDir -Filter "$id*.vtt" -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending |
+               Select-Object -First 1
     }
 
-    if (-not $vtt) { return $false }
+    if (-not $vtt) {
+        return $false
+    }
 
     Convert-VttToTxt $vtt.FullName $out
     Remove-Item $vtt.FullName -Force -ErrorAction SilentlyContinue
-    return $true
+
+    return (Test-Path -LiteralPath $out)
 }
 
 function Get-Whisper {
@@ -321,21 +331,37 @@ function Get-Whisper {
 
     if (-not (Test-Path $Yt2TxtScript)) { return $false }
 
+    # Track files BEFORE execution for reliable fallback detection
+    $before = @(Get-ChildItem $WhisperDir -Filter "*.txt" -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty FullName)
+
     & $Yt2TxtScript -Url "https://www.youtube.com/watch?v=$id" `
         -DownloadDir $AudioDir `
         -WhisperDir  $WhisperDir
 
-    Start-Sleep 2
+    Start-Sleep 3
 
-    $txt = Get-ChildItem $WhisperDir -Filter "*$id*.txt" -ErrorAction SilentlyContinue |
+    # Try strict ID match first
+    $escapedId = [regex]::Escape($id)
+    $txt = Get-ChildItem $WhisperDir -Filter "*$escapedId*.txt" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
-    if ($txt) {
+    # Fallback: newest file created during run (handles non-ID-named outputs)
+    if (-not $txt) {
+        $after = Get-ChildItem $WhisperDir -Filter "*.txt" -ErrorAction SilentlyContinue
+        $txt = $after |
+            Where-Object { $before -notcontains $_.FullName } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
+
+    if ($txt -and (Test-Path $txt.FullName)) {
         Copy-Item $txt.FullName $out -Force
         return $true
     }
 
+    Write-Host "  -> Whisper failed to produce usable output" -ForegroundColor DarkGray
     return $false
 }
 
@@ -461,6 +487,8 @@ Write-Host "Videos found: $total" -ForegroundColor Cyan
 # ─────────────────────────────────────────
 
 $processed = 0
+$renamed   = 0
+$restamped = 0
 
 foreach ($v in $videos) {
 
@@ -474,49 +502,106 @@ foreach ($v in $videos) {
     $txt = Join-Path $TranscriptsDir "$stem.txt"
     $md  = Join-Path $OutlinesDir    "$stem.md"
 
-    # ID-based lookup with preferStem for unambiguous matching (IMPROVEMENT #1 & #3)
+    # ID-based lookup — prefer file already matching target stem
     $existingTxt = Find-ByVideoId $TranscriptsDir $v.Id ".txt" $stem
     $existingMd  = Find-ByVideoId $OutlinesDir    $v.Id ".md"  $stem
 
-    # ── RENAME NORMALIZATION + DUPLICATE CLEANUP (IMPROVEMENT #2) ──
+    # ── RENAME NORMALIZATION ──
+    $didRename = $false
 
     if ($existingTxt -and $existingTxt.FullName -ne $txt) {
-        Write-Host "  -> Renaming transcript" -ForegroundColor DarkGray
-        Rename-Item -LiteralPath $existingTxt.FullName -NewName "$stem.txt" -ErrorAction SilentlyContinue
-        $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
-        # Remove stale duplicates with same ID left over from pre-numbering runs
-        $escapedId = [regex]::Escape($v.Id)
-        Get-ChildItem -LiteralPath $TranscriptsDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match "\[$escapedId\]\.txt$" -and $_.FullName -ne $txt } |
-            ForEach-Object { 
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                Write-Host "  -> Removed duplicate transcript: $($_.Name)" -ForegroundColor DarkGray 
-            }
+        if (-not $DryRun) {
+            Rename-Item -LiteralPath $existingTxt.FullName -NewName "$stem.txt" -ErrorAction SilentlyContinue
+            $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
+            # Remove stale duplicates with same ID left over from pre-numbering runs
+            $escapedId = [regex]::Escape($v.Id)
+            Get-ChildItem -LiteralPath $TranscriptsDir -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match "\[$escapedId\]\.txt$" -and $_.FullName -ne $txt } |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+        Write-Host "  -> Renamed transcript" -ForegroundColor DarkGray
+        $didRename = $true; $renamed++
     }
 
     if ($existingMd -and $existingMd.FullName -ne $md) {
-        Write-Host "  -> Renaming outline" -ForegroundColor DarkGray
-        Rename-Item -LiteralPath $existingMd.FullName -NewName "$stem.md" -ErrorAction SilentlyContinue
-        $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
-        # Remove stale duplicates with same ID left over from pre-numbering runs
-        $escapedId = [regex]::Escape($v.Id)
-        Get-ChildItem -LiteralPath $OutlinesDir -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match "\[$escapedId\]\.md$" -and $_.FullName -ne $md } |
-            ForEach-Object { 
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                Write-Host "  -> Removed duplicate outline: $($_.Name)" -ForegroundColor DarkGray 
-            }
+        if (-not $DryRun) {
+            Rename-Item -LiteralPath $existingMd.FullName -NewName "$stem.md" -ErrorAction SilentlyContinue
+            $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
+            # Remove stale duplicates with same ID left over from pre-numbering runs
+            $escapedId = [regex]::Escape($v.Id)
+            Get-ChildItem -LiteralPath $OutlinesDir -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match "\[$escapedId\]\.md$" -and $_.FullName -ne $md } |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+        Write-Host "  -> Renamed outline" -ForegroundColor DarkGray
+        $didRename = $true
     }
 
-    # ── DRY RUN ──
+    # ── NORMALIZE MODE ──
+    if ($Normalize) {
+        if (-not ($existingTxt -or $existingMd)) {
+            Write-Host "  -> Not found locally, skipping" -ForegroundColor DarkGray
+            continue
+        }
+
+        if ($DryRun) {
+            Write-Host "  -> DryRun: would restamp $stem" -ForegroundColor DarkGray
+            continue
+        }
+
+        $uploadDt = Get-UploadDate $v.Id
+
+        if ($uploadDt) {
+            $txtPath = if ($existingTxt -and (Test-Path -LiteralPath $txt)) { $txt }
+                       elseif ($existingTxt) { $existingTxt.FullName } else { $null }
+
+            $mdPath  = if ($existingMd -and (Test-Path -LiteralPath $md)) { $md }
+                       elseif ($existingMd) { $existingMd.FullName } else { $null }
+
+            $stamped = $false
+
+            if ($txtPath) {
+                $cur = [IO.File]::GetLastWriteTime($txtPath)
+                if ([math]::Abs(($cur - $uploadDt).TotalSeconds) -gt 60) {
+                    Set-FileDate $txtPath $uploadDt
+                    $stamped = $true
+                    $restamped++
+                }
+            }
+
+            if ($mdPath) {
+                $cur = [IO.File]::GetLastWriteTime($mdPath)
+                if ([math]::Abs(($cur - $uploadDt).TotalSeconds) -gt 60) {
+                    Set-FileDate $mdPath $uploadDt
+                    $stamped = $true
+                }
+            }
+
+            $label = if ($stamped) { "Restamped" } else { "Date OK" }
+            Write-Host "  -> $label $($uploadDt.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
+        }
+
+        continue
+    }
+
+    # ── NORMAL MODE ──
 
     if ($DryRun) {
         Write-Host "  -> DryRun: $stem" -ForegroundColor DarkGray
         continue
     }
 
-    # ── TRANSCRIPT ──
+    if (-not $Force -and $existingTxt -and $existingMd) {
+        if (-not $didRename) {
+            Write-Host "  -> Skipping (exists)" -ForegroundColor DarkGray
+        }
+        $processed++
+        continue
+    }
 
+    $uploadDt = $null
+
+    # ── TRANSCRIPT ──
     if (-not $existingTxt -or $Force) {
 
         $ok = $false
@@ -540,42 +625,49 @@ foreach ($v in $videos) {
             continue
         }
 
+        # 🔴 HARD VALIDATION: Ensure file actually exists after generation
+        if (-not (Test-Path -LiteralPath $txt)) {
+            Write-Host "  -> ERROR: transcript not found after generation" -ForegroundColor Red
+            continue
+        }
+
         $existingTxt = Get-Item -LiteralPath $txt -ErrorAction SilentlyContinue
         Write-Host "  -> Transcript saved" -ForegroundColor Green
+
+        $uploadDt = Get-UploadDate $v.Id
+        if ($uploadDt) {
+            Set-FileDate $txt $uploadDt
+            Write-Host "  -> Dated: $($uploadDt.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
+        }
     }
-    else {
-        Write-Host "  -> Using existing transcript" -ForegroundColor DarkGray
+
+    # 🔴 SECOND HARD GATE: Prevent crash if transcript is missing before outline
+    if (-not (Test-Path -LiteralPath $txt)) {
+        Write-Host "  -> ERROR: transcript missing, skipping outline" -ForegroundColor Red
+        continue
     }
 
     # ── OUTLINE ──
-
     if (-not $existingMd -or $Force) {
 
         Write-Host "  -> Outline..." -ForegroundColor Cyan
 
         if (Get-Outline $txt $md) {
             Write-Host "  -> Saved" -ForegroundColor Green
+
             $existingMd = Get-Item -LiteralPath $md -ErrorAction SilentlyContinue
+
+            if (-not $uploadDt) {
+                $uploadDt = Get-UploadDate $v.Id
+            }
+
+            if ($uploadDt) {
+                Set-FileDate $md $uploadDt
+            }
         }
         else {
             Write-Host "  -> Outline skipped/failed" -ForegroundColor DarkGray
         }
-    }
-    else {
-        Write-Host "  -> Using existing outline" -ForegroundColor DarkGray
-    }
-
-    # ── FULL RETROACTIVE DATE NORMALIZATION ──
-
-    $uploadDt = Get-UploadDate $v.Id
-    if ($uploadDt) {
-        if ($existingTxt -and (Test-Path -LiteralPath $existingTxt.FullName)) {
-            Set-FileDate $existingTxt.FullName $uploadDt
-        }
-        if ($existingMd -and (Test-Path -LiteralPath $existingMd.FullName)) {
-            Set-FileDate $existingMd.FullName $uploadDt
-        }
-        Write-Host "  -> Dated: $($uploadDt.ToString('yyyy-MM-dd'))" -ForegroundColor DarkGray
     }
 
     $processed++
@@ -584,4 +676,8 @@ foreach ($v in $videos) {
 # Cleanup temp
 Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-Write-Host "`nDone: $processed / $total" -ForegroundColor Cyan
+if ($Normalize) {
+    Write-Host "`nNormalize: $renamed renamed, $restamped restamped / $total videos" -ForegroundColor Cyan
+} else {
+    Write-Host "`nDone: $processed / $total" -ForegroundColor Cyan
+}
